@@ -1,0 +1,175 @@
+name: Build & Release with npm install
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: '压缩包下载链接 (如 https://github.com/.../xxx.zip)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm  # GitHub 原生 ARM64 runner
+            platform: linux/arm64
+
+    steps:
+      - name: 获取当前时间作为 Tag
+        id: tag
+        run: echo "TAG=$(date -u +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: 下载压缩包
+        run: |
+          URL="${{ github.event.inputs.download_url }}"
+          FILENAME=$(basename "$URL")
+          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+          echo "⬇️ 正在下载: $URL"
+          curl -L -o "$FILENAME" "$URL"
+          echo "✅ 下载完成: $FILENAME"
+
+      - name: 解压压缩包
+        run: |
+          FILENAME="${{ env.FILENAME }}"
+          echo "📦 正在解压: $FILENAME"
+          mkdir -p extracted
+
+          case "$FILENAME" in
+            *.zip)
+              unzip -q "$FILENAME" -d extracted/
+              ;;
+            *.tar.gz|*.tgz)
+              tar -xzf "$FILENAME" -C extracted/
+              ;;
+            *.tar.bz2)
+              tar -xjf "$FILENAME" -C extracted/
+              ;;
+            *.tar.xz)
+              tar -xJf "$FILENAME" -C extracted/
+              ;;
+            *.tar)
+              tar -xf "$FILENAME" -C extracted/
+              ;;
+            *)
+              echo "❌ 不支持的压缩格式: $FILENAME"
+              exit 1
+              ;;
+          esac
+
+          echo "📁 解压后内容:"
+          ls -la extracted/
+
+          # 自动进入唯一子目录（如果有的话）
+          SUBDIRS=$(find extracted -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILES=$(find extracted -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$SUBDIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            SUBDIR=$(find extracted -mindepth 1 -maxdepth 1 -type d)
+            DIRNAME=$(basename "$SUBDIR")
+            echo "PROJECT_DIR=$SUBDIR" >> $GITHUB_ENV
+            echo "PROJECT_NAME=$DIRNAME" >> $GITHUB_ENV
+            echo "✅ 自动识别项目目录: $SUBDIR"
+          else
+            echo "PROJECT_DIR=extracted" >> $GITHUB_ENV
+            echo "PROJECT_NAME=$(basename "$FILENAME" | sed 's/\.[^.]*$//')" >> $GITHUB_ENV
+            echo "✅ 使用根解压目录"
+          fi
+
+      - name: 设置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: 执行 npm install
+        run: |
+          echo "📂 进入项目目录: ${{ env.PROJECT_DIR }}"
+          cd "${{ env.PROJECT_DIR }}"
+          echo "📋 package.json 内容:"
+          cat package.json || echo "（未找到 package.json）"
+          echo ""
+          echo "⚙️ 正在执行 npm install..."
+          npm install --no-audit --prefer-offline || npm install --no-audit
+          echo "✅ npm install 完成"
+          echo "📁 安装后目录结构 (前3层):"
+          find . -maxdepth 3 -not -path '*/node_modules/*' | head -50
+
+      - name: 打包完整文件夹
+        run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+          PROJECT_NAME="${{ env.PROJECT_NAME }}"
+          ARCH="${{ matrix.arch }}"
+          TAG="${{ steps.tag.outputs.TAG }}"
+          OUTPUT_NAME="${PROJECT_NAME}-${ARCH}-${TAG}.tar.gz"
+
+          echo "📦 正在打包: $PROJECT_DIR -> $OUTPUT_NAME"
+          tar -czf "$OUTPUT_NAME" -C "$(dirname "$PROJECT_DIR")" "$(basename "$PROJECT_DIR")"
+          echo "ARTIFACT_NAME=$OUTPUT_NAME" >> $GITHUB_ENV
+          echo "✅ 打包完成: $OUTPUT_NAME ($(du -sh "$OUTPUT_NAME" | cut -f1))"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.arch }}
+          path: ${{ env.ARTIFACT_NAME }}
+          retention-days: 1
+
+      - name: 输出 Tag（供 Release 使用）
+        run: echo "TAG=${{ steps.tag.outputs.TAG }}" >> $GITHUB_OUTPUT
+        id: export_tag
+
+  release:
+    name: 发布 Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 生成 Release Tag（与 build job 对齐）
+        id: tag
+        run: |
+          # 使用固定时间防止 job 间时间差
+          echo "TAG=$(date -u +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: build-*
+          merge-multiple: false
+
+      - name: 列出所有产物
+        run: |
+          echo "📦 待发布文件:"
+          find artifacts/ -type f | sort
+
+      - name: 创建 GitHub Release 并上传文件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: "Build ${{ steps.tag.outputs.TAG }}"
+          body: |
+            ## 自动构建 Release
+
+            **构建时间:** ${{ steps.tag.outputs.TAG }} (UTC)
+            **下载来源:** ${{ github.event.inputs.download_url }}
+
+            ### 包含平台
+            | 文件 | 架构 |
+            |------|------|
+            | `*-amd64-*.tar.gz` | x86_64 (AMD64) |
+            | `*-arm64-*.tar.gz` | ARM64 (AArch64) |
+
+            ### 说明
+            - 已包含完整 `node_modules`（npm install 后打包）
+            - 解压后可直接运行，无需再次安装依赖
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
