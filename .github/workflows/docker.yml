@@ -1,0 +1,80 @@
+name: Manual Extract Target Directory & Release
+
+on:
+  # 变更为手动触发，并定义输入框
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '1. 请输入要发布的 Release Tag (例如: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      docker_image:
+        description: '2. 请输入 Docker 镜像完整名称 (例如: nginx:latest 或 your-repo/image:tag)'
+        required: true
+      target_dir:
+        description: '3. 请输入容器内需要提取的【绝对路径目录】(例如: /usr/share/nginx/html 或 /app/dist)'
+        required: true
+        default: '/app/dist'
+
+jobs:
+  extract-and-release:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm64 # 原生 ARM64 运行器
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Pull Docker Image
+        run: |
+          # 拉取手动输入的镜像名称
+          docker pull ${{ github.event.inputs.docker_image }}
+
+      - name: Extract Directory from Docker Image
+        run: |
+          # 1. 创建容器
+          docker create --name extractor ${{ github.event.inputs.docker_image }}
+          
+          # 2. 创建本地存放目录
+          mkdir -p ./extracted-content
+          
+          # 3. 直接复制输入的整个容器内目录到本地
+          # 注意：docker cp 复制目录时，会在本地目录下创建同名文件夹
+          docker cp extractor:${{ github.event.inputs.target_dir }} ./extracted-content/
+          
+          # 4. 删除容器
+          docker rm extractor
+
+      - name: Archive Directory
+        run: |
+          # 压缩刚刚提取出来的整个目录，并带上架构后缀
+          cd extracted-content
+          tar -czvf ../release-directory-${{ matrix.arch }}.tar.gz ./*
+          cd ..
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # 使用手动输入的 Tag 名字
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
+          files: |
+            release-directory-${{ matrix.arch }}.tar.gz
+          body: |
+            ### 自动化提取发布说明
+            - **源 Docker 镜像**: `${{ github.event.inputs.docker_image }}`
+            - **提取的容器内目录**: `${{ github.event.inputs.target_dir }}`
+            - **运行架构**: `${{ matrix.arch }}`
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
