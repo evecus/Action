@@ -1,4 +1,4 @@
-name: Manual Extract Target Directory & Release
+name: 提取docker文件
 
 on:
   # 变更为手动触发，并定义输入框
