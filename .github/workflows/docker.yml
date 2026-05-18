@@ -7,14 +7,14 @@ on:
       release_tag:
         description: '1. 请输入要发布的 Release Tag (例如: v1.0.0)'
         required: true
-        default: 'v1.0.0'
+        default: 'v'
       docker_image:
         description: '2. 请输入 Docker 镜像完整名称 (例如: nginx:latest 或 your-repo/image:tag)'
         required: true
       target_dir:
         description: '3. 请输入容器内需要提取的【绝对路径目录】(例如: /usr/share/nginx/html 或 /app/dist)'
         required: true
-        default: '/app/dist'
+        default: '/app'
 
 jobs:
   extract-and-release:
