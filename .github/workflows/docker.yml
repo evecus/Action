@@ -25,7 +25,7 @@ jobs:
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
-            runner: ubuntu-24.04-arm64 # 原生 ARM64 运行器
+            runner: ubuntu-24.04-arm # 原生 ARM64 运行器
 
     permissions:
       contents: write
