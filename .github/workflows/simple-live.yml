@@ -1,8 +1,9 @@
-name: Build Android arm64 APK
+name: Build Simple_live arm64 APK
 
 on:
   workflow_dispatch: {}  # 手动触发，无需任何输入参数
-
+  schedule:
+    - cron: '0 2 */3 * *'
 jobs:
   build-android-arm64:
     runs-on: ubuntu-22.04
@@ -10,21 +11,30 @@ jobs:
       contents: write
 
     steps:
-      # ── 1. 获取上游最新 Release 信息 ────────────────────────────────────
-      - name: Get latest upstream release
+      # ── 1. 获取上游最新【普通版】Release ────────────────────────────────
+      # TV 版 tag 以 "tv_" 开头，普通版以 "v" 开头，遍历列表找第一个非 tv_ 的即可
+      - name: Get latest upstream app release (non-TV)
         id: upstream
         run: |
           release_json=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/June6699/dart_simple_live/releases/latest")
+            "https://api.github.com/repos/June6699/dart_simple_live/releases?per_page=20")
 
-          tag=$(echo "$release_json" | jq -r '.tag_name')
-          zipball=$(echo "$release_json" | jq -r '.zipball_url')
+          # 过滤掉 tv_ 开头的 tag，取第一条
+          tag=$(echo "$release_json" | python3 -c "
+          import json, sys
+          releases = json.load(sys.stdin)
+          for r in releases:
+              if not r['tag_name'].startswith('tv_'):
+                  print(r['tag_name'])
+                  break
+          ")
+
+          zipball="https://api.github.com/repos/June6699/dart_simple_live/zipball/$tag"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "zipball=$zipball" >> "$GITHUB_OUTPUT"
-          echo "✅ Latest upstream release tag: $tag"
-          echo "📦 Zipball: $zipball"
+          echo "✅ Latest app release tag: $tag"
 
       # ── 2. 检查本仓库是否已存在该 tag，避免重复发布 ─────────────────────
       - name: Check if release already exists
@@ -38,7 +48,7 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag")
           if [[ "$status" == "200" ]]; then
             echo "already_exists=true" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Release $tag already exists in this repo, skipping build."
+            echo "⚠️  Release $tag already exists, skipping."
           else
             echo "already_exists=false" >> "$GITHUB_OUTPUT"
             echo "✅ Release $tag not found, proceeding with build."
@@ -50,17 +60,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          zipball="${{ steps.upstream.outputs.zipball }}"
-          # zipball_url 需要认证（private 也能用，public 也可以）
           curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
-            -L "$zipball" \
+            -L "${{ steps.upstream.outputs.zipball }}" \
             -o upstream-source.zip
           unzip -q upstream-source.zip
-          # GitHub zipball 解压出来的目录名含 commit hash，统一重命名为 source
           extracted_dir=$(unzip -Z1 upstream-source.zip | head -1 | cut -d/ -f1)
           mv "$extracted_dir" source
-          echo "📁 Source extracted to: source/"
+          echo "📁 Source extracted: source/"
 
       # ── 4. 签名（可选）────────────────────────────────────────────────────
       # 在仓库 Settings → Secrets and variables → Actions 里添加以下 Secret：
@@ -68,7 +75,6 @@ jobs:
       #   STORE_PASSWORD   —  keystore 密码
       #   KEY_ALIAS        —  key 别名
       #   KEY_PASSWORD     —  key 密码
-      # 未配置时自动回退 debug 签名，APK 可用但升级需卸载重装。
       - name: Prepare Android keystore (optional)
         if: steps.check.outputs.already_exists == 'false'
         shell: bash
@@ -169,7 +175,7 @@ jobs:
             | App 版本 | `${{ steps.app_version.outputs.app_version }}` |
             | 架构 | `arm64-v8a` |
 
-            > 如需其他架构（armeabi-v7a / x86_64），请自行触发 workflow 修改。
+            > 如需其他架构（armeabi-v7a / x86_64），请自行修改 workflow。
           generate_release_notes: false
           prerelease: ${{ contains(steps.upstream.outputs.tag, 'beta') || contains(steps.upstream.outputs.tag, 'alpha') || contains(steps.upstream.outputs.tag, 'pre') }}
           token: ${{ github.token }}
