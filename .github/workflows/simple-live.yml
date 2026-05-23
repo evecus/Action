@@ -1,16 +1,7 @@
 name: Build Android arm64 APK
 
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "上游仓库的 Git ref（branch/tag/commit），默认拉取最新 master"
-        required: false
-        default: "master"
-      release_tag:
-        description: "发布的 Release tag 名称，例如 v1.12.1-arm64（留空则不创建 Release）"
-        required: false
-        default: ""
+  workflow_dispatch: {}  # 手动触发，无需任何输入参数
 
 jobs:
   build-android-arm64:
@@ -19,44 +10,87 @@ jobs:
       contents: write
 
     steps:
-      # ── 1. 拉取上游源码 ──────────────────────────────────────────────
-      - name: Checkout upstream source
-        uses: actions/checkout@v4
-        with:
-          repository: June6699/dart_simple_live
-          ref: ${{ inputs.ref }}
-          path: source
+      # ── 1. 获取上游最新 Release 信息 ────────────────────────────────────
+      - name: Get latest upstream release
+        id: upstream
+        run: |
+          release_json=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/June6699/dart_simple_live/releases/latest")
 
-      # ── 2. 签名（可选）────────────────────────────────────────────────
-      # 如果你在仓库 Settings → Secrets 里配置了以下四个 Secret，就会用你的
-      # 签名证书；否则自动回退到 debug 签名（APK 仍可安装，但每次重装需卸载旧版）。
-      #
-      #   KEYSTORE_BASE64   — keystore 文件的 base64 编码（见下方说明）
-      #   STORE_PASSWORD    — keystore 密码
-      #   KEY_ALIAS         — key 别名
-      #   KEY_PASSWORD      — key 密码
-      #
-      # 生成 base64：base64 -w 0 your.keystore > keystore.b64
+          tag=$(echo "$release_json" | jq -r '.tag_name')
+          zipball=$(echo "$release_json" | jq -r '.zipball_url')
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "zipball=$zipball" >> "$GITHUB_OUTPUT"
+          echo "✅ Latest upstream release tag: $tag"
+          echo "📦 Zipball: $zipball"
+
+      # ── 2. 检查本仓库是否已存在该 tag，避免重复发布 ─────────────────────
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.upstream.outputs.tag }}"
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag")
+          if [[ "$status" == "200" ]]; then
+            echo "already_exists=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Release $tag already exists in this repo, skipping build."
+          else
+            echo "already_exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Release $tag not found, proceeding with build."
+          fi
+
+      # ── 3. 下载上游 Release 源码 zip 并解压 ─────────────────────────────
+      - name: Download upstream source zip
+        if: steps.check.outputs.already_exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zipball="${{ steps.upstream.outputs.zipball }}"
+          # zipball_url 需要认证（private 也能用，public 也可以）
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -L "$zipball" \
+            -o upstream-source.zip
+          unzip -q upstream-source.zip
+          # GitHub zipball 解压出来的目录名含 commit hash，统一重命名为 source
+          extracted_dir=$(unzip -Z1 upstream-source.zip | head -1 | cut -d/ -f1)
+          mv "$extracted_dir" source
+          echo "📁 Source extracted to: source/"
+
+      # ── 4. 签名（可选）────────────────────────────────────────────────────
+      # 在仓库 Settings → Secrets and variables → Actions 里添加以下 Secret：
+      #   KEYSTORE_BASE64  —  keystore 文件的 base64（base64 -w 0 your.jks）
+      #   STORE_PASSWORD   —  keystore 密码
+      #   KEY_ALIAS        —  key 别名
+      #   KEY_PASSWORD     —  key 密码
+      # 未配置时自动回退 debug 签名，APK 可用但升级需卸载重装。
       - name: Prepare Android keystore (optional)
+        if: steps.check.outputs.already_exists == 'false'
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD:  ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD:    ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS:       ${{ secrets.KEY_ALIAS }}
         run: |
           if [[ -n "$KEYSTORE_BASE64" && -n "$STORE_PASSWORD" && -n "$KEY_PASSWORD" && -n "$KEY_ALIAS" ]]; then
-            echo "✅ Release keystore detected, using release signing."
+            echo "✅ Using release keystore."
             printf '%s' "$KEYSTORE_BASE64" | base64 -d > source/simple_live_app/android/release-keystore.jks
             printf 'storeFile=../release-keystore.jks\nstorePassword=%s\nkeyPassword=%s\nkeyAlias=%s\n' \
               "$STORE_PASSWORD" "$KEY_PASSWORD" "$KEY_ALIAS" \
               > source/simple_live_app/android/key.properties
           else
-            echo "⚠️  No keystore secrets found, will fall back to debug signing."
+            echo "⚠️  No keystore configured, falling back to debug signing."
           fi
 
-      # ── 3. 环境准备 ────────────────────────────────────────────────────
+      # ── 5. 环境准备 ──────────────────────────────────────────────────────
       - name: Setup Java 17
+        if: steps.check.outputs.already_exists == 'false'
         uses: actions/setup-java@v4
         with:
           distribution: zulu
@@ -64,68 +98,79 @@ jobs:
           cache: gradle
 
       - name: Setup Flutter
+        if: steps.check.outputs.already_exists == 'false'
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.41.x"
           cache: true
 
-      # ── 4. 依赖安装 ────────────────────────────────────────────────────
+      # ── 6. 安装依赖 ──────────────────────────────────────────────────────
       - name: Install dependencies
+        if: steps.check.outputs.already_exists == 'false'
         run: |
           cd source/simple_live_app
           flutter pub get
 
-      # ── 5. 读取版本号 ──────────────────────────────────────────────────
+      # ── 7. 读取 pubspec 版本号 ────────────────────────────────────────────
       - name: Read app version
+        if: steps.check.outputs.already_exists == 'false'
         id: app_version
         run: |
           ver=$(grep '^version:' source/simple_live_app/pubspec.yaml | awk '{print $2}')
           echo "app_version=$ver" >> "$GITHUB_OUTPUT"
           echo "App version: $ver"
 
-      # ── 6. 编译 arm64-v8a APK ──────────────────────────────────────────
+      # ── 8. 编译 arm64-v8a APK ────────────────────────────────────────────
       - name: Build arm64-v8a APK
+        if: steps.check.outputs.already_exists == 'false'
         run: |
           cd source/simple_live_app
           flutter build apk --release \
             --split-per-abi \
             --target-platform android-arm64
 
-      # ── 7. 重命名产物 ──────────────────────────────────────────────────
+      # ── 9. 重命名产物 ─────────────────────────────────────────────────────
       - name: Rename APK
+        if: steps.check.outputs.already_exists == 'false'
         id: apk
         run: |
+          tag="${{ steps.upstream.outputs.tag }}"
           src="source/simple_live_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
-          dst="SimpleLive-${{ steps.app_version.outputs.app_version }}-arm64.apk"
+          dst="SimpleLive-${tag}-arm64.apk"
           cp "$src" "$dst"
           echo "apk_path=$dst" >> "$GITHUB_OUTPUT"
           echo "APK: $dst  ($(du -sh "$dst" | cut -f1))"
 
-      # ── 8. 上传到 Artifacts（无论是否发 Release 都保留） ───────────────
+      # ── 10. 上传到 Artifacts ──────────────────────────────────────────────
       - name: Upload APK to Artifacts
+        if: steps.check.outputs.already_exists == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: SimpleLive-arm64
           path: ${{ steps.apk.outputs.apk_path }}
           retention-days: 30
 
-      # ── 9. 创建 / 更新 GitHub Release（仅当填写了 release_tag 时） ─────
+      # ── 11. 发布 GitHub Release ───────────────────────────────────────────
       - name: Publish GitHub Release
-        if: ${{ inputs.release_tag != '' }}
+        if: steps.check.outputs.already_exists == 'false'
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ inputs.release_tag }}
-          name: ${{ inputs.release_tag }}
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: ${{ steps.upstream.outputs.tag }}
           body: |
-            ## SimpleLive Android arm64 Build
+            ## SimpleLive Android arm64
 
-            - 上游版本：`${{ steps.app_version.outputs.app_version }}`
-            - 上游 ref：`${{ inputs.ref }}`
-            - 架构：`arm64-v8a`
-            - 构建时间：${{ github.event.head_commit.timestamp || 'manual trigger' }}
+            本 Release 由 GitHub Actions 自动构建，源码来自上游仓库。
 
-            > 由 GitHub Actions 自动从 [June6699/dart_simple_live](https://github.com/June6699/dart_simple_live) 编译。
+            | 项目 | 内容 |
+            |------|------|
+            | 上游仓库 | [June6699/dart_simple_live](https://github.com/June6699/dart_simple_live) |
+            | 上游版本 | `${{ steps.upstream.outputs.tag }}` |
+            | App 版本 | `${{ steps.app_version.outputs.app_version }}` |
+            | 架构 | `arm64-v8a` |
+
+            > 如需其他架构（armeabi-v7a / x86_64），请自行触发 workflow 修改。
           generate_release_notes: false
-          prerelease: ${{ contains(inputs.release_tag, 'beta') || contains(inputs.release_tag, 'alpha') || contains(inputs.release_tag, 'pre') }}
+          prerelease: ${{ contains(steps.upstream.outputs.tag, 'beta') || contains(steps.upstream.outputs.tag, 'alpha') || contains(steps.upstream.outputs.tag, 'pre') }}
           token: ${{ github.token }}
           files: ${{ steps.apk.outputs.apk_path }}
