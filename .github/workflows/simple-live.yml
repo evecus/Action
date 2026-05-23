@@ -162,7 +162,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.upstream.outputs.tag }}
-          name: ${{ steps.upstream.outputs.tag }}
+          name: Simple_live Android arm64${{ steps.upstream.outputs.tag }}
           body: |
             ## SimpleLive Android arm64
 
