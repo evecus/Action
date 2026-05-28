@@ -51,10 +51,9 @@ jobs:
         run: |
           file target/binary
           ls -lh target/binary
-          # Print Go build info if available
           go version -m target/binary 2>/dev/null || echo "[!] No Go build info (binary may be stripped)"
 
-      # ── 5. Install dependencies ────────────────────────────────────────
+      # ── 5. Install system dependencies ────────────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -62,26 +61,30 @@ jobs:
             openjdk-17-jdk-headless \
             binutils \
             python3 \
-            python3-pip \
             curl \
             unzip \
             git
 
-      # ── 6. Restore symbol table with GoReSym ───────────────────────────
-      #    GoReSym recovers function names, types, and source paths even
-      #    when the binary was compiled with -ldflags="-s -w".
+      # ── 6. Install GoReSym (build from source via go install) ──────────
+      #    Building from source avoids brittle version/filename assumptions.
+      #    GoReSym v3.2 supports Go 1.21–1.24 pclntab layouts.
       - name: Install GoReSym
         run: |
-          GORESYM_VER="2.7.5"
-          curl -fsSL \
-            "https://github.com/mandiant/GoReSym/releases/download/v${GORESYM_VER}/GoReSym_linux" \
-            -o /usr/local/bin/goresym
-          chmod +x /usr/local/bin/goresym
+          # go install always fetches the latest tagged release
+          go install github.com/mandiant/GoReSym@v3.2
+          # go install puts binary in $(go env GOPATH)/bin
+          sudo cp "$(go env GOPATH)/bin/GoReSym" /usr/local/bin/goresym
+          goresym -about 2>/dev/null || goresym --help 2>/dev/null | head -5 || true
 
+      # ── 7. Run GoReSym ─────────────────────────────────────────────────
       - name: Run GoReSym
         run: |
           mkdir -p output/goresym
+          # -d  include standard library functions
+          # -p  include source file paths
+          # -t  include type information
           goresym -d -p -t target/binary > output/goresym/symbols.json 2>&1 || true
+
           echo "--- GoReSym summary ---"
           python3 - <<'EOF'
           import json, sys
@@ -96,85 +99,115 @@ jobs:
               if len(pkgs) > 30:
                   print(f"  ... and {len(pkgs)-30} more")
           except Exception as e:
-              print(f"Could not parse JSON: {e}")
+              print(f"Could not parse symbols.json: {e}")
+              print("First 500 chars of output:")
+              print(open("output/goresym/symbols.json").read()[:500])
           EOF
 
-      # ── 7. Extract strings ─────────────────────────────────────────────
+      # ── 8. Extract strings ─────────────────────────────────────────────
       - name: Extract strings
         run: |
           mkdir -p output/strings
           strings -n 6 target/binary > output/strings/all_strings.txt
-          wc -l output/strings/all_strings.txt
-          # Filter likely source paths
+          echo "Total strings: $(wc -l < output/strings/all_strings.txt)"
           grep -E '\.go:|/go/src|github\.com|golang\.org' \
             output/strings/all_strings.txt \
             > output/strings/source_hints.txt || true
           echo "Source path hints: $(wc -l < output/strings/source_hints.txt)"
 
-      # ── 8. Install & run Ghidra headless ───────────────────────────────
+      # ── 9. Cache & install Ghidra 11.3 ────────────────────────────────
       - name: Cache Ghidra
         id: cache-ghidra
         uses: actions/cache@v4
         with:
           path: ~/ghidra
-          key: ghidra-11.1.2
+          key: ghidra-11.3
 
-      - name: Download Ghidra
+      - name: Download Ghidra 11.3
         if: steps.cache-ghidra.outputs.cache-hit != 'true'
         run: |
-          GHIDRA_VER="11.1.2"
-          GHIDRA_DATE="20240709"
           curl -fsSL \
-            "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VER}_build/ghidra_${GHIDRA_VER}_PUBLIC_${GHIDRA_DATE}.zip" \
+            "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3_build/ghidra_11.3_PUBLIC_20250205.zip" \
             -o /tmp/ghidra.zip
           unzip -q /tmp/ghidra.zip -d ~/
-          mv ~/ghidra_${GHIDRA_VER}_PUBLIC ~/ghidra
+          mv ~/ghidra_11.3_PUBLIC ~/ghidra
+          echo "Ghidra installed: $(ls ~/ghidra)"
 
+      # ── 10. Write Ghidra decompiler script ────────────────────────────
       - name: Write Ghidra post-analysis script
         run: |
-          cat > /tmp/export_decompiled.py << 'PYEOF'
-          # Ghidra headless post-analysis script
-          # Exports decompiled C-like pseudocode for every function.
-          import os
-          from ghidra.app.decompiler import DecompInterface
-          from ghidra.util.task import ConsoleTaskMonitor
+          mkdir -p /tmp/ghidra_scripts
+          cat > /tmp/ghidra_scripts/ExportDecompiled.java << 'JAVAEOF'
+          // Ghidra headless post-analysis script (Java)
+          // Exports decompiled C pseudocode, one file per namespace/package.
+          //@category Analysis
 
-          out_dir = "/tmp/ghidra_out"
-          os.makedirs(out_dir, exist_ok=True)
+          import ghidra.app.decompiler.DecompInterface;
+          import ghidra.app.decompiler.DecompileResults;
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.listing.Function;
+          import ghidra.program.model.listing.FunctionIterator;
+          import ghidra.util.task.ConsoleTaskMonitor;
+          import java.io.*;
+          import java.nio.file.*;
+          import java.util.*;
 
-          iface = DecompInterface()
-          iface.openProgram(currentProgram)
-          monitor = ConsoleTaskMonitor()
+          public class ExportDecompiled extends GhidraScript {
+              @Override
+              public void run() throws Exception {
+                  String outDir = "/tmp/ghidra_out";
+                  Files.createDirectories(Paths.get(outDir));
 
-          funcs = list(currentProgram.getFunctionManager().getFunctions(True))
-          print("Total functions: {}".format(len(funcs)))
+                  DecompInterface decompiler = new DecompInterface();
+                  decompiler.openProgram(currentProgram);
 
-          pkg_files = {}
+                  FunctionIterator funcs = currentProgram.getListing()
+                      .getFunctions(true);
 
-          for fn in funcs:
-              name = fn.getName()
-              ns   = fn.getParentNamespace().getName(True)  # full package path
-              key  = ns if ns else "unknown"
+                  Map<String, StringBuilder> pkgFiles = new LinkedHashMap<>();
+                  int total = 0, failed = 0;
 
-              result = iface.decompileFunction(fn, 30, monitor)
-              if result and result.getDecompiledFunction():
-                  code = result.getDecompiledFunction().getC()
-              else:
-                  code = "/* decompilation failed for {} */\n".format(name)
+                  while (funcs.hasNext()) {
+                      Function fn = funcs.next();
+                      String name = fn.getName();
+                      String ns   = fn.getParentNamespace().getName(true);
+                      String key  = (ns == null || ns.isEmpty()) ? "unknown" : ns;
 
-              if key not in pkg_files:
-                  pkg_files[key] = []
-              pkg_files[key].append("// Function: {}\n{}\n".format(name, code))
+                      DecompileResults res = decompiler.decompileFunction(
+                          fn, 30, new ConsoleTaskMonitor());
 
-          for pkg, snippets in pkg_files.items():
-              safe = pkg.replace("/", "__").replace("::", "__")
-              path = os.path.join(out_dir, safe + ".c")
-              with open(path, "w") as f:
-                  f.write("\n".join(snippets))
+                      String code;
+                      if (res != null && res.getDecompiledFunction() != null) {
+                          code = res.getDecompiledFunction().getC();
+                      } else {
+                          code = "/* decompilation failed: " + name + " */\n";
+                          failed++;
+                      }
 
-          print("Wrote {} package files".format(len(pkg_files)))
-          PYEOF
+                      pkgFiles.computeIfAbsent(key, k -> new StringBuilder())
+                          .append("// ── ").append(name).append(" ──\n")
+                          .append(code).append("\n");
+                      total++;
+                  }
 
+                  for (Map.Entry<String, StringBuilder> e : pkgFiles.entrySet()) {
+                      String safe = e.getKey()
+                          .replace("/", "__")
+                          .replace("::", "__")
+                          .replaceAll("[^a-zA-Z0-9._\\-]", "_");
+                      Path p = Paths.get(outDir, safe + ".c");
+                      Files.writeString(p, e.getValue().toString());
+                  }
+
+                  println("Functions total  : " + total);
+                  println("Decompile failed : " + failed);
+                  println("Output files     : " + pkgFiles.size());
+                  decompiler.dispose();
+              }
+          }
+          JAVAEOF
+
+      # ── 11. Run Ghidra headless analysis ──────────────────────────────
       - name: Run Ghidra headless analysis
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
@@ -184,88 +217,100 @@ jobs:
           ~/ghidra/support/analyzeHeadless \
             /tmp/ghidra_project GoDecompile \
             -import target/binary \
-            -postScript /tmp/export_decompiled.py \
-            -scriptPath /tmp \
+            -postScript ExportDecompiled.java \
+            -scriptPath /tmp/ghidra_scripts \
             -log /tmp/ghidra_analysis.log \
             -overwrite \
-            2>&1 | tail -40 || true
+            2>&1 | tail -50 || true
 
-          # Move output into workspace
-          cp -r /tmp/ghidra_out/. output/ghidra/ 2>/dev/null || true
-          echo "Ghidra output files: $(ls output/ghidra | wc -l)"
+          # Copy output into workspace
+          if ls /tmp/ghidra_out/*.c 1>/dev/null 2>&1; then
+            cp /tmp/ghidra_out/*.c output/ghidra/
+            echo "Ghidra output files: $(ls output/ghidra/*.c | wc -l)"
+          else
+            echo "[!] No .c files produced — check ghidra log"
+            tail -30 /tmp/ghidra_analysis.log || true
+          fi
 
-      # ── 9. Generate human-readable summary ────────────────────────────
+          # Always save the full Ghidra log
+          cp /tmp/ghidra_analysis.log output/ghidra_analysis.log 2>/dev/null || true
+
+      # ── 12. Generate summary report ───────────────────────────────────
       - name: Generate summary report
         run: |
           python3 - << 'EOF'
-          import json, os, glob
+          import json, os, glob, subprocess
 
-          lines = ["# Go Binary Decompilation Report\n"]
+          lines = ["# Go Binary Decompilation Report\n\n"]
 
-          # --- Binary info ---
-          import subprocess
+          # Binary info
           r = subprocess.run(["file", "target/binary"], capture_output=True, text=True)
-          lines.append("## Binary Info\n```\n" + r.stdout.strip() + "\n```\n")
+          lines.append("## Binary Info\n```\n" + r.stdout.strip() + "\n```\n\n")
 
           r2 = subprocess.run(["go", "version", "-m", "target/binary"],
-                              capture_output=True, text=True)
+                               capture_output=True, text=True)
           if r2.returncode == 0:
-              lines.append("## Go Build Metadata\n```\n" + r2.stdout.strip() + "\n```\n")
+              lines.append("## Go Build Metadata\n```\n" + r2.stdout.strip() + "\n```\n\n")
+          else:
+              lines.append("## Go Build Metadata\n> Not available (binary may be stripped)\n\n")
 
-          # --- GoReSym ---
+          # GoReSym results
           try:
               data = json.load(open("output/goresym/symbols.json"))
               funcs = data.get("UserFunctions", []) + data.get("StdFunctions", [])
               pkgs  = sorted({f['PackageName'] for f in funcs if f.get('PackageName')})
-              lines.append(f"## GoReSym: Recovered Symbols\n")
-              lines.append(f"- **Functions recovered**: {len(funcs)}\n")
-              lines.append(f"- **Packages**: {len(pkgs)}\n")
-              lines.append("\n### Package List\n```\n" + "\n".join(pkgs) + "\n```\n")
+              lines.append(f"## GoReSym Results\n")
+              lines.append(f"- Functions recovered: **{len(funcs)}**\n")
+              lines.append(f"- Packages detected: **{len(pkgs)}**\n\n")
+              lines.append("### Package List\n```\n" + "\n".join(pkgs) + "\n```\n\n")
 
-              # Top 20 functions by name length (usually most interesting)
               user = sorted(data.get("UserFunctions", []),
-                            key=lambda f: f.get('FullName',''), )
-              lines.append("\n### User-defined Functions (first 50)\n```\n")
-              for f in user[:50]:
-                  lines.append(f"  {f.get('FullName','?')}  @{f.get('Start','?')}\n")
-              lines.append("```\n")
+                            key=lambda f: f.get('FullName', ''))
+              if user:
+                  lines.append("### User-defined Functions (first 50)\n```\n")
+                  for f in user[:50]:
+                      lines.append(f"  {f.get('FullName','?')}  @{f.get('Start','?')}\n")
+                  lines.append("```\n\n")
           except Exception as e:
-              lines.append(f"## GoReSym\nFailed: {e}\n")
+              lines.append(f"## GoReSym Results\n> Parse failed: {e}\n\n")
 
-          # --- Source hints ---
+          # Source hints
           try:
               hints = open("output/strings/source_hints.txt").read().strip().splitlines()
-              lines.append(f"\n## Source Path Hints ({len(hints)} found)\n```\n")
+              lines.append(f"## Source Path Hints ({len(hints)} found)\n```\n")
               for h in hints[:60]:
                   lines.append(h + "\n")
-              lines.append("```\n")
+              if len(hints) > 60:
+                  lines.append(f"... and {len(hints)-60} more\n")
+              lines.append("```\n\n")
           except:
               pass
 
-          # --- Ghidra output ---
+          # Ghidra output
           ghidra_files = glob.glob("output/ghidra/*.c")
-          lines.append(f"\n## Ghidra Decompiled Files\n")
-          lines.append(f"{len(ghidra_files)} package files generated.\n")
-          for gf in sorted(ghidra_files)[:20]:
+          lines.append(f"## Ghidra Decompiled Files\n")
+          lines.append(f"Total package files: **{len(ghidra_files)}**\n\n")
+          for gf in sorted(ghidra_files)[:30]:
               sz = os.path.getsize(gf)
-              lines.append(f"- `{os.path.basename(gf)}` ({sz} bytes)\n")
+              lines.append(f"- `{os.path.basename(gf)}` ({sz:,} bytes)\n")
 
           with open("output/REPORT.md", "w") as f:
               f.writelines(lines)
 
-          print("Report written.")
+          print("Report written to output/REPORT.md")
           EOF
 
-      # ── 10. Print summary to Actions log ──────────────────────────────
+      # ── 13. Print summary to Actions log ──────────────────────────────
       - name: Print summary
         run: |
           echo "=========================================="
           cat output/REPORT.md
           echo "=========================================="
+          echo ""
           echo "Output structure:"
           find output -type f | sort
 
-      # ── 11. Upload all results as artifact ────────────────────────────
+      # ── 14. Upload all results as artifact ────────────────────────────
       - name: Upload decompilation artifact
         uses: actions/upload-artifact@v4
         with:
