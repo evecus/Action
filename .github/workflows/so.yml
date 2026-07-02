@@ -34,11 +34,24 @@ jobs:
       - name: Create Flutter dummy project
         run: |
           flutter create --platforms=android dummy_project
-          cd dummy_project
-          cat >> pubspec.yaml << EOF
 
-            media_kit_libs_android_video: ${{ steps.version.outputs.version }}
-          EOF
+      - name: Add media_kit dependency to pubspec.yaml
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cd dummy_project
+          # 用 python 精确插入到 dependencies: 节点下
+          python3 << PYEOF
+          import re
+          version = "${VERSION}"
+          with open("pubspec.yaml", "r") as f:
+              content = f.read()
+          new_dep = "\n  media_kit_libs_android_video: ^" + version
+          content = re.sub(r"(^dependencies:\s*$)", r"\1" + new_dep, content, flags=re.MULTILINE)
+          with open("pubspec.yaml", "w") as f:
+              f.write(content)
+          print("Updated pubspec.yaml:")
+          print(content)
+          PYEOF
 
       - name: Fetch media_kit_libs_android_video
         run: |
@@ -48,72 +61,51 @@ jobs:
       - name: Locate .so files
         id: locate
         run: |
-          PUB_CACHE=$(flutter pub cache dir 2>/dev/null || echo "$HOME/.pub-cache")
-          echo "pub_cache=$PUB_CACHE" >> $GITHUB_OUTPUT
-
+          PUB_CACHE="${HOME}/.pub-cache"
           PKG_DIR=$(find "$PUB_CACHE" -type d -name "media_kit_libs_android_video-*" 2>/dev/null | head -1)
-          if [ -z "$PKG_DIR" ]; then
-            # fallback: search in project .dart_tool
-            PKG_DIR=$(find dummy_project -type d -name "media_kit_libs_android_video*" 2>/dev/null | head -1)
-          fi
           echo "pkg_dir=$PKG_DIR" >> $GITHUB_OUTPUT
           echo "Found package at: $PKG_DIR"
+          echo "=== .so files found ==="
           find "$PKG_DIR" -name "*.so" 2>/dev/null | sort
 
-      - name: Build AAR structure
+      - name: Build AAR
         run: |
           PKG_DIR="${{ steps.locate.outputs.pkg_dir }}"
           VERSION="${{ steps.version.outputs.version }}"
-          AAR_NAME="mpv-android-$VERSION"
-          WORK_DIR="/tmp/aar_build/$AAR_NAME"
+          AAR_NAME="mpv-android-${VERSION}"
+          WORK_DIR="/tmp/aar_build/${AAR_NAME}"
 
-          mkdir -p "$WORK_DIR/jni/arm64-v8a"
-          mkdir -p "$WORK_DIR/jni/armeabi-v7a"
+          mkdir -p "${WORK_DIR}/jni/arm64-v8a"
+          mkdir -p "${WORK_DIR}/jni/armeabi-v7a"
 
-          # Copy .so files for both ABIs
           for ABI in arm64-v8a armeabi-v7a; do
-            SRC=$(find "$PKG_DIR" -path "*/$ABI/*.so" 2>/dev/null)
-            if [ -n "$SRC" ]; then
-              echo "Copying $ABI .so files:"
-              find "$PKG_DIR" -path "*/$ABI/*.so" | while read f; do
-                echo "  $f"
-                cp "$f" "$WORK_DIR/jni/$ABI/"
-              done
-            else
-              echo "WARNING: No .so files found for $ABI"
-            fi
+            find "${PKG_DIR}" -path "*/${ABI}/*.so" | while read f; do
+              echo "Copying: $f"
+              cp "$f" "${WORK_DIR}/jni/${ABI}/"
+            done
           done
 
-          # Create AndroidManifest.xml
-          cat > "$WORK_DIR/AndroidManifest.xml" << 'MANIFEST'
+          cat > "${WORK_DIR}/AndroidManifest.xml" << 'MANIFEST'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="is.xyz.mpv">
           </manifest>
           MANIFEST
 
-          # Create R.txt (empty, required for AAR)
-          touch "$WORK_DIR/R.txt"
+          touch "${WORK_DIR}/R.txt"
 
-          # Create classes.jar (empty, required for AAR)
+          # 创建空 classes.jar
           mkdir -p /tmp/empty_classes
           cd /tmp/empty_classes
-          jar cf "$WORK_DIR/classes.jar" -C . . 2>/dev/null || \
-            zip -r "$WORK_DIR/classes.jar" . --include="*.class" 2>/dev/null || \
-            touch "$WORK_DIR/classes.jar"
+          zip -r "${WORK_DIR}/classes.jar" . 2>/dev/null || touch "${WORK_DIR}/classes.jar"
 
-          # Package as AAR (zip with .aar extension)
-          cd "$WORK_DIR"
-          zip -r "/tmp/$AAR_NAME.aar" .
-          echo "AAR size: $(du -h /tmp/$AAR_NAME.aar | cut -f1)"
-          echo "AAR contents:"
-          unzip -l "/tmp/$AAR_NAME.aar"
+          cd "${WORK_DIR}"
+          zip -r "/tmp/${AAR_NAME}.aar" .
 
-      - name: List .so files in AAR
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          echo "=== .so files included ==="
-          unzip -l "/tmp/mpv-android-$VERSION.aar" | grep "\.so"
+          echo "=== AAR 内容 ==="
+          unzip -l "/tmp/${AAR_NAME}.aar"
+          echo "=== AAR 大小 ==="
+          du -h "/tmp/${AAR_NAME}.aar"
 
       - name: Upload AAR artifact
         uses: actions/upload-artifact@v4
@@ -122,7 +114,7 @@ jobs:
           path: /tmp/mpv-android-${{ steps.version.outputs.version }}.aar
           retention-days: 30
 
-      - name: Upload individual .so files (backup)
+      - name: Upload .so files (backup)
         uses: actions/upload-artifact@v4
         with:
           name: mpv-so-files-${{ steps.version.outputs.version }}
@@ -133,14 +125,12 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           echo "## ✅ MPV AAR 打包完成" >> $GITHUB_STEP_SUMMARY
+          echo "**版本**: media_kit_libs_android_video ${VERSION}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**版本**: media_kit_libs_android_video $VERSION" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**包含的 .so 文件**:" >> $GITHUB_STEP_SUMMARY
-          unzip -l "/tmp/mpv-android-$VERSION.aar" | grep "\.so" | awk '{print "- `" $4 "`"}' >> $GITHUB_STEP_SUMMARY
+          echo "### 包含的 .so 文件" >> $GITHUB_STEP_SUMMARY
+          unzip -l "/tmp/mpv-android-${VERSION}.aar" | grep "\.so" | awk '{print "- `" $4 "`"}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 使用方法" >> $GITHUB_STEP_SUMMARY
-          echo "1. 下载 artifact \`mpv-android-$VERSION\`" >> $GITHUB_STEP_SUMMARY
-          echo "2. 将 \`mpv-android-$VERSION.aar\` 放到项目 \`app/libs/\` 目录" >> $GITHUB_STEP_SUMMARY
-          echo "3. 确认 \`build.gradle\` 中有 \`api fileTree(dir: \"libs\", include: [\"*.aar\"])\`" >> $GITHUB_STEP_SUMMARY
-          echo "4. 删除 \`implementation 'com.github.mpv-android:mpv-android:n20231205'\` 这行" >> $GITHUB_STEP_SUMMARY
+          echo "1. 下载 artifact \`mpv-android-${VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. 将 \`mpv-android-${VERSION}.aar\` 放到 \`app/libs/\`" >> $GITHUB_STEP_SUMMARY
+          echo "3. 删除 \`build.gradle\` 中 \`implementation 'com.github.mpv-android:mpv-android:n20231205'\`" >> $GITHUB_STEP_SUMMARY
