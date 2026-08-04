@@ -53,20 +53,33 @@ jobs:
       # 2. 下载该 release 对应的 Source code (zip)，而不是 checkout 默认分支，
       #    确保编译的正是这个 release 标记的源码版本
       - name: 下载 Release 源码 (Source code zip)
-        shell: bash
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          curl -L -H "Authorization: Bearer $GH_TOKEN" \
-               -o source.zip \
-               "${{ steps.release.outputs.zipball_url }}"
-          mkdir extracted
-          unzip -q source.zip -d extracted
+          $ErrorActionPreference = "Stop"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $zipUrl = "${{ steps.release.outputs.zipball_url }}"
+
+          Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile "source.zip"
+
+          $extractDir = Join-Path $env:GITHUB_WORKSPACE "extracted"
+          Expand-Archive -Path "source.zip" -DestinationPath $extractDir -Force
+
           # GitHub 生成的 zip 内是单一顶层目录（如 June6699-dart_simple_live-<sha>）
-          SRC_DIR=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)
-          echo "解压得到目录: $SRC_DIR"
-          mv "$SRC_DIR" "$GITHUB_WORKSPACE/src"
+          $srcDir = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1
+          if (-not $srcDir) {
+            throw "解压后未找到源码目录"
+          }
+          Write-Host "解压得到目录: $($srcDir.FullName)"
+
+          $targetDir = Join-Path $env:GITHUB_WORKSPACE "src"
+          Move-Item -Path $srcDir.FullName -Destination $targetDir -Force
+
+          if (-not (Test-Path (Join-Path $targetDir "simple_live_app"))) {
+            throw "移动后未找到 src/simple_live_app，目录结构可能与预期不符: $targetDir"
+          }
+          Write-Host "源码已就位: $targetDir"
 
       - name: 安装 Flutter
         uses: subosito/flutter-action@v2
@@ -80,11 +93,11 @@ jobs:
 
       # 3. 编译 Windows 端（主 App 在 simple_live_app 子目录）
       - name: 获取依赖
-        working-directory: src/simple_live_app
+        working-directory: ${{ github.workspace }}/src/simple_live_app
         run: flutter pub get
 
       - name: 编译 Windows Release
-        working-directory: src/simple_live_app
+        working-directory: ${{ github.workspace }}/src/simple_live_app
         run: flutter build windows --release
 
       # 4. 定位编译产物，动态探测 exe 名称，避免硬编码
@@ -92,7 +105,8 @@ jobs:
         id: locate
         shell: pwsh
         run: |
-          $releaseDir = Get-ChildItem -Path "src/simple_live_app/build/windows" -Recurse -Directory |
+          $winBuildPath = Join-Path $env:GITHUB_WORKSPACE "src\simple_live_app\build\windows"
+          $releaseDir = Get-ChildItem -Path $winBuildPath -Recurse -Directory |
             Where-Object { $_.Name -eq "Release" -and $_.FullName -match "runner" } |
             Select-Object -First 1
 
