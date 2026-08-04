@@ -1,0 +1,213 @@
+name: simple-live-Windows-installer
+
+# 手动触发：可以在 Actions 页面点击 "Run workflow" 运行
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建的 release tag（留空则自动使用最新 release）"
+        required: false
+        default: ""
+      flutter_version:
+        description: "Flutter 版本（留空使用 stable 最新版；仓库当前用 3.41.9）"
+        required: false
+        default: "3.41.9"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+
+    steps:
+      # 1. 确定要构建的版本：用户输入的 tag，或仓库当前最新 release
+      - name: 获取最新 Release 信息
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -e
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            RELEASE_JSON=$(gh api "repos/$REPO/releases/tags/$TAG")
+          else
+            RELEASE_JSON=$(gh api "repos/$REPO/releases/latest")
+            TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          fi
+
+          UPLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.upload_url' | sed 's/{.*}//')
+          RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r '.id')
+          TARBALL_URL=$(echo "$RELEASE_JSON" | jq -r '.tarball_url')
+          ZIPBALL_URL=$(echo "$RELEASE_JSON" | jq -r '.zipball_url')
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "upload_url=$UPLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "zipball_url=$ZIPBALL_URL" >> "$GITHUB_OUTPUT"
+          echo "检测到 tag: $TAG"
+
+      # 2. 下载该 release 对应的 Source code (zip)，而不是 checkout 默认分支，
+      #    确保编译的正是这个 release 标记的源码版本
+      - name: 下载 Release 源码 (Source code zip)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          curl -L -H "Authorization: Bearer $GH_TOKEN" \
+               -o source.zip \
+               "${{ steps.release.outputs.zipball_url }}"
+          mkdir extracted
+          unzip -q source.zip -d extracted
+          # GitHub 生成的 zip 内是单一顶层目录（如 June6699-dart_simple_live-<sha>）
+          SRC_DIR=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)
+          echo "解压得到目录: $SRC_DIR"
+          mv "$SRC_DIR" "$GITHUB_WORKSPACE/src"
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ github.event.inputs.flutter_version }}
+          channel: "stable"
+          cache: true
+
+      - name: 启用 Windows 桌面支持
+        run: flutter config --enable-windows-desktop
+
+      # 3. 编译 Windows 端（主 App 在 simple_live_app 子目录）
+      - name: 获取依赖
+        working-directory: src/simple_live_app
+        run: flutter pub get
+
+      - name: 编译 Windows Release
+        working-directory: src/simple_live_app
+        run: flutter build windows --release
+
+      # 4. 定位编译产物，动态探测 exe 名称，避免硬编码
+      - name: 定位编译产物
+        id: locate
+        shell: pwsh
+        run: |
+          $releaseDir = Get-ChildItem -Path "src/simple_live_app/build/windows" -Recurse -Directory |
+            Where-Object { $_.Name -eq "Release" -and $_.FullName -match "runner" } |
+            Select-Object -First 1
+
+          if (-not $releaseDir) {
+            throw "未找到 build/windows/*/runner/Release 目录，编译产物路径可能已变化"
+          }
+
+          $exe = Get-ChildItem -Path $releaseDir.FullName -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw "未在 Release 目录中找到 exe 文件"
+          }
+
+          $exeName = $exe.Name
+          $appName = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
+
+          echo "release_dir=$($releaseDir.FullName)" >> $env:GITHUB_OUTPUT
+          echo "exe_name=$exeName" >> $env:GITHUB_OUTPUT
+          echo "app_name=$appName" >> $env:GITHUB_OUTPUT
+          Write-Host "发布目录: $($releaseDir.FullName)"
+          Write-Host "可执行文件: $exeName"
+
+      # 5. 安装 Inno Setup 并生成安装包
+      - name: 安装 Inno Setup
+        run: choco install innosetup -y
+
+      - name: 生成 Inno Setup 脚本
+        id: iss
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.release.outputs.tag }}"
+          # 版本号去掉前缀 v，Inno Setup 的 AppVersion 建议使用纯数字风格但也可接受任意字符串
+          $version = $tag -replace '^v', ''
+          $releaseDir = "${{ steps.locate.outputs.release_dir }}"
+          $exeName = "${{ steps.locate.outputs.exe_name }}"
+          $appName = "SimpleLive"
+          $outputDir = "$env:GITHUB_WORKSPACE\installer_output"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          $issLines = @(
+            "[Setup]",
+            "AppId={{B6C1D6C4-9F2E-4B7A-9E3D-SIMPLELIVE001}}",
+            "AppName=$appName",
+            "AppVersion=$version",
+            "AppPublisher=SimpleLive",
+            "DefaultDirName={autopf}\$appName",
+            "DefaultGroupName=$appName",
+            "DisableProgramGroupPage=yes",
+            "OutputDir=$outputDir",
+            "OutputBaseFilename=SimpleLive-Windows-Setup-$tag",
+            "Compression=lzma",
+            "SolidCompression=yes",
+            "WizardStyle=modern",
+            "ArchitecturesAllowed=x64compatible",
+            "ArchitecturesInstallIn64BitMode=x64compatible",
+            "UninstallDisplayIcon={app}\$exeName",
+            "",
+            "[Languages]",
+            'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"',
+            'Name: "english"; MessagesFile: "compiler:Default.isl"',
+            "",
+            "[Tasks]",
+            'Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"',
+            "",
+            "[Files]",
+            "Source: `"$releaseDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs",
+            "",
+            "[Icons]",
+            "Name: `"{group}\$appName`"; Filename: `"{app}\$exeName`"",
+            "Name: `"{autodesktop}\$appName`"; Filename: `"{app}\$exeName`"; Tasks: desktopicon",
+            "",
+            "[Run]",
+            "Filename: `"{app}\$exeName`"; Description: `"启动 $appName`"; Flags: nowait postinstall skipifsilent"
+          )
+          $issContent = $issLines -join "`r`n"
+
+          $issPath = "$env:GITHUB_WORKSPACE\installer.iss"
+          Set-Content -Path $issPath -Value $issContent -Encoding UTF8
+          echo "iss_path=$issPath" >> $env:GITHUB_OUTPUT
+          echo "output_dir=$outputDir" >> $env:GITHUB_OUTPUT
+          echo "installer_name=SimpleLive-Windows-Setup-$tag.exe" >> $env:GITHUB_OUTPUT
+
+      - name: 编译安装包
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "${{ steps.iss.outputs.iss_path }}"
+
+      - name: 校验安装包已生成
+        shell: pwsh
+        run: |
+          $path = "${{ steps.iss.outputs.output_dir }}\${{ steps.iss.outputs.installer_name }}"
+          if (-not (Test-Path $path)) {
+            throw "安装包未生成: $path"
+          }
+          Write-Host "安装包已生成: $path"
+
+      # 6. 上传安装包到对应 tag 的 Release（若同名资产已存在则先删除再上传，保证幂等）
+      - name: 上传安装包到 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          RELEASE_ID="${{ steps.release.outputs.release_id }}"
+          ASSET_NAME="${{ steps.iss.outputs.installer_name }}"
+          ASSET_PATH="${{ steps.iss.outputs.output_dir }}/${{ steps.iss.outputs.installer_name }}"
+
+          # 若已存在同名资产，先删除，避免上传失败
+          EXISTING_ID=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" \
+            --jq ".[] | select(.name == \"$ASSET_NAME\") | .id" || true)
+          if [ -n "$EXISTING_ID" ]; then
+            echo "发现同名资产 (id=$EXISTING_ID)，先删除"
+            gh api -X DELETE "repos/$REPO/releases/assets/$EXISTING_ID"
+          fi
+
+          gh release upload "${{ steps.release.outputs.tag }}" "$ASSET_PATH" --repo "$REPO" --clobber
+
+          echo "已上传: $ASSET_NAME 到 release ${{ steps.release.outputs.tag }}"
