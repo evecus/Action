@@ -1,0 +1,69 @@
+name: Decompile NeatDM
+
+on:
+  workflow_dispatch:
+    inputs:
+      exe_path:
+        description: Path to the exe to decompile, relative to repo root
+        required: true
+        default: extracted/app/NeatDM.exe
+      ghidra_version:
+        description: Ghidra tag to use (empty = latest release)
+        required: false
+        default: ''
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Verify exe exists
+        run: |
+          test -f "${{ github.workspace }}/${{ inputs.exe_path }}" || { echo "exe not found: ${{ inputs.exe_path }}"; exit 1; }
+
+      - name: Download Ghidra
+        id: ghidra
+        run: |
+          VERSION="${{ inputs.ghidra_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(curl -sL https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+          fi
+          echo "Ghidra tag: $VERSION"
+          ASSET=$(curl -sL "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/$VERSION" \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+' \
+            | grep -iP 'ghidra_.*_PUBLIC.*\.zip' | grep -vi 'src' | head -1)
+          [ -n "$ASSET" ] || { echo "no PUBLIC zip asset for $VERSION"; exit 1; }
+          echo "Asset: $ASSET"
+          curl -sL -o ghidra.zip "$ASSET"
+          unzip -q ghidra.zip
+          DIR=$(ls -d ghidra_* | head -1)
+          echo "GHIDRA_INSTALL_DIR=$PWD/$DIR" >> "$GITHUB_ENV"
+          echo "installed: $DIR"
+
+      - name: Decompile with Ghidra headless
+        run: |
+          mkdir -p "${{ github.workspace }}/output"
+          "$GHIDRA_INSTALL_DIR/support/analyzeHeadless" /tmp/ndmproj NDM \
+            -import "${{ github.workspace }}/${{ inputs.exe_path }}" \
+            -scriptPath "${{ github.workspace }}/tools/ghidra" \
+            -postScript ExportAll.java "${{ github.workspace }}/output" \
+            -analysisTimeoutPerFile 1200 -max-cpu 4 \
+            -deleteProject 2>&1 | tail -30
+
+      - name: List output
+        run: |
+          ls -la "${{ github.workspace }}/output"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled
+          path: output/*
