@@ -1,6 +1,8 @@
 name: simple-live-Windows-installer
 
 # 手动触发：可以在 Actions 页面点击 "Run workflow" 运行
+# 不再本地编译 Flutter 源码，而是直接下载源仓库官方发布的已编译 Windows zip 资产，
+# 再用 Inno Setup 打包成安装程序，避免本地编译环境（MSVC/依赖版本等）带来的各种问题。
 on:
   workflow_dispatch:
     inputs:
@@ -8,13 +10,9 @@ on:
         description: "要构建的源仓库 release tag（留空则自动使用源仓库最新 release）"
         required: false
         default: ""
-      flutter_version:
-        description: "Flutter 版本（留空使用 stable 最新版；仓库当前用 3.41.9）"
-        required: false
-        default: "3.41.9"
 
 env:
-  # 源码仓库：workflow 从这里检测最新 release、下载 Source code 并编译
+  # 源码仓库：workflow 从这里检测最新 release、下载已编译的 Windows zip 资产
   # 注意：这与运行本 workflow 所在的仓库（github.repository）是两回事
   SOURCE_REPO: June6699/dart_simple_live
 
@@ -26,11 +24,11 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      # 0. 检出当前仓库自身（用于后续在本仓库创建 release/tag，与源码下载互不影响）
+      # 0. 检出当前仓库自身（用于后续在本仓库创建 release/tag）
       - name: 检出当前仓库
         uses: actions/checkout@v4
 
-      # 1. 确定要构建的版本：用户输入的 tag，或源仓库当前最新 release
+      # 1. 确定要构建的版本，并定位 Windows zip 资产
       - name: 获取源仓库最新 Release 信息
         id: release
         shell: bash
@@ -48,100 +46,57 @@ jobs:
             TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
           fi
 
-          ZIPBALL_URL=$(echo "$RELEASE_JSON" | jq -r '.zipball_url')
-          SOURCE_RELEASE_NAME=$(echo "$RELEASE_JSON" | jq -r '.name // .tag_name')
           SOURCE_RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
 
+          # 主 App 的 Windows 资产固定命名为 SimpleLive-Windows-<tag>.zip
+          ASSET_NAME="SimpleLive-Windows-${TAG}.zip"
+          ASSET_URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .browser_download_url')
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" == "null" ]; then
+            echo "未找到预期资产名 $ASSET_NAME，列出该 release 下所有资产供排查："
+            echo "$RELEASE_JSON" | jq -r '.assets[].name'
+            exit 1
+          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "zipball_url=$ZIPBALL_URL" >> "$GITHUB_OUTPUT"
-          echo "source_release_name=$SOURCE_RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$ASSET_URL" >> "$GITHUB_OUTPUT"
           echo "source_release_url=$SOURCE_RELEASE_URL" >> "$GITHUB_OUTPUT"
           echo "检测到源仓库 ($REPO) tag: $TAG"
+          echo "Windows 资产: $ASSET_NAME"
 
-      # 2. 下载该 release 对应的 Source code (zip)，而不是 checkout 默认分支，
-      #    确保编译的正是这个 release 标记的源码版本
-      - name: 下载 Release 源码 (Source code zip)
+      # 2. 下载并解压官方已编译好的 Windows zip
+      - name: 下载并解压 Windows 发布包
+        id: extract
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
-          $zipUrl = "${{ steps.release.outputs.zipball_url }}"
+          $assetUrl = "${{ steps.release.outputs.asset_url }}"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "windows-release.zip"
 
-          Invoke-WebRequest -Uri $zipUrl -Headers $headers -OutFile "source.zip"
+          Invoke-WebRequest -Uri $assetUrl -Headers $headers -OutFile $zipPath
 
-          $extractDir = Join-Path $env:GITHUB_WORKSPACE "extracted"
-          Expand-Archive -Path "source.zip" -DestinationPath $extractDir -Force
+          $extractDir = Join-Path $env:GITHUB_WORKSPACE "app-release"
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
-          # GitHub 生成的 zip 内是单一顶层目录（如 June6699-dart_simple_live-<sha>）
-          $srcDir = Get-ChildItem -Path $extractDir -Directory | Select-Object -First 1
-          if (-not $srcDir) {
-            throw "解压后未找到源码目录"
-          }
-          Write-Host "解压得到目录: $($srcDir.FullName)"
-
-          $targetDir = Join-Path $env:GITHUB_WORKSPACE "upstream-src"
-          Move-Item -Path $srcDir.FullName -Destination $targetDir -Force
-
-          if (-not (Test-Path (Join-Path $targetDir "simple_live_app"))) {
-            throw "移动后未找到 upstream-src/simple_live_app，目录结构可能与预期不符: $targetDir"
-          }
-          Write-Host "源码已就位: $targetDir"
-
-      - name: 安装 Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ github.event.inputs.flutter_version }}
-          channel: "stable"
-          cache: true
-
-      - name: 启用 Windows 桌面支持
-        run: flutter config --enable-windows-desktop
-
-      # 3. 编译 Windows 端（主 App 在 simple_live_app 子目录）
-      - name: 获取依赖
-        working-directory: ${{ github.workspace }}/upstream-src/simple_live_app
-        run: flutter pub get
-
-      - name: 编译 Windows Release
-        working-directory: ${{ github.workspace }}/upstream-src/simple_live_app
-        env:
-          # 部分第三方插件（如 flutter_inappwebview_windows）仍在使用已被新版 MSVC
-          # 标记为废弃/报错的 <experimental/coroutine>，这里临时压制该错误以保证可编译。
-          # 若插件后续更新修复了该问题，可以去掉这个环境变量。
-          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
-        run: flutter build windows --release
-
-      # 4. 定位编译产物，动态探测 exe 名称，避免硬编码
-      - name: 定位编译产物
-        id: locate
-        shell: pwsh
-        run: |
-          $winBuildPath = Join-Path $env:GITHUB_WORKSPACE "upstream-src\simple_live_app\build\windows"
-          $releaseDir = Get-ChildItem -Path $winBuildPath -Recurse -Directory |
-            Where-Object { $_.Name -eq "Release" -and $_.FullName -match "runner" } |
-            Select-Object -First 1
-
-          if (-not $releaseDir) {
-            throw "未找到 build/windows/*/runner/Release 目录，编译产物路径可能已变化"
-          }
-
-          $exe = Get-ChildItem -Path $releaseDir.FullName -Filter "*.exe" | Select-Object -First 1
+          # 官方 zip 有的会带一层顶层目录，有的直接就是文件；两种情况都要能定位到 exe
+          $exe = Get-ChildItem -Path $extractDir -Recurse -Filter "*.exe" | Select-Object -First 1
           if (-not $exe) {
-            throw "未在 Release 目录中找到 exe 文件"
+            throw "解压后未找到任何 .exe 文件，压缩包结构可能与预期不符"
           }
 
+          $appDir = $exe.DirectoryName
           $exeName = $exe.Name
-          $appName = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
 
-          echo "release_dir=$($releaseDir.FullName)" >> $env:GITHUB_OUTPUT
+          echo "app_dir=$appDir" >> $env:GITHUB_OUTPUT
           echo "exe_name=$exeName" >> $env:GITHUB_OUTPUT
-          echo "app_name=$appName" >> $env:GITHUB_OUTPUT
-          Write-Host "发布目录: $($releaseDir.FullName)"
+          Write-Host "应用目录: $appDir"
           Write-Host "可执行文件: $exeName"
 
-      # 5. 安装 Inno Setup 并生成安装包
+      # 3. 安装 Inno Setup 并生成安装包
       - name: 安装 Inno Setup
         run: choco install innosetup -y
 
@@ -176,8 +131,8 @@ jobs:
           $tag = "${{ steps.release.outputs.tag }}"
           # 版本号去掉前缀 v，Inno Setup 的 AppVersion 建议使用纯数字风格但也可接受任意字符串
           $version = $tag -replace '^v', ''
-          $releaseDir = "${{ steps.locate.outputs.release_dir }}"
-          $exeName = "${{ steps.locate.outputs.exe_name }}"
+          $appDir = "${{ steps.extract.outputs.app_dir }}"
+          $exeName = "${{ steps.extract.outputs.exe_name }}"
           $appName = "SimpleLive"
           $outputDir = "$env:GITHUB_WORKSPACE\installer_output"
           New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
@@ -216,7 +171,7 @@ jobs:
             ('Name: "desktopicon"; Description: "' + $(if ($zhAvailable) { "创建桌面快捷方式" } else { "Create a desktop shortcut" }) + '"; GroupDescription: "' + $(if ($zhAvailable) { "附加图标:" } else { "Additional icons:" }) + '"'),
             "",
             "[Files]",
-            "Source: `"$releaseDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs",
+            "Source: `"$appDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs",
             "",
             "[Icons]",
             "Name: `"{group}\$appName`"; Filename: `"{app}\$exeName`"",
@@ -247,7 +202,7 @@ jobs:
           }
           Write-Host "安装包已生成: $path"
 
-      # 6. 发布安装包到【当前仓库】的 release，tag 沿用源仓库的版本号
+      # 4. 发布安装包到【当前仓库】的 release，tag 沿用源仓库的版本号
       #    若当前仓库还没有这个 tag 对应的 release，则自动创建一个
       - name: 发布/上传安装包到本仓库 Release
         shell: bash
@@ -263,13 +218,12 @@ jobs:
           ASSET_PATH="${{ steps.iss.outputs.output_dir }}/${{ steps.iss.outputs.installer_name }}"
 
           # 检查本仓库是否已存在该 tag 的 release，不存在则创建
-          # （若本仓库连该 tag 本身都没有，gh release create 会基于默认分支自动打一个新 tag）
           if ! gh api "repos/$REPO/releases/tags/$TAG" >/dev/null 2>&1; then
             echo "本仓库尚无 tag=$TAG 的 release，正在创建..."
             gh release create "$TAG" \
               --repo "$REPO" \
               --title "$TAG" \
-              --notes "自动构建自源仓库 $SOURCE_REPO 的 $TAG 版本 Windows 安装包。源 release: $SOURCE_RELEASE_URL"
+              --notes "自动打包自源仓库 $SOURCE_REPO 的 $TAG 版本官方 Windows 发布包（未额外编译，仅重新打包为安装程序）。源 release: $SOURCE_RELEASE_URL"
           else
             echo "本仓库已存在 tag=$TAG 的 release，将直接上传/覆盖资产"
           fi
