@@ -145,6 +145,30 @@ jobs:
       - name: 安装 Inno Setup
         run: choco install innosetup -y
 
+      - name: 下载简体中文语言包
+        id: zhlang
+        shell: pwsh
+        run: |
+          $langDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
+          if (-not (Test-Path $langDir)) {
+            New-Item -ItemType Directory -Force -Path $langDir | Out-Null
+          }
+          $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl"
+          $dest = Join-Path $langDir "ChineseSimplified.isl"
+
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $dest -ErrorAction Stop
+            if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) {
+              Write-Host "简体中文语言包已就位: $dest"
+              echo "available=true" >> $env:GITHUB_OUTPUT
+            } else {
+              throw "下载后文件为空"
+            }
+          } catch {
+            Write-Warning "简体中文语言包下载失败，安装向导将回退为仅英文: $_"
+            echo "available=false" >> $env:GITHUB_OUTPUT
+          }
+
       - name: 生成 Inno Setup 脚本
         id: iss
         shell: pwsh
@@ -157,6 +181,8 @@ jobs:
           $appName = "SimpleLive"
           $outputDir = "$env:GITHUB_WORKSPACE\installer_output"
           New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          $zhAvailable = "${{ steps.zhlang.outputs.available }}" -eq "true"
 
           $issLines = @(
             "[Setup]",
@@ -176,12 +202,18 @@ jobs:
             "ArchitecturesInstallIn64BitMode=x64compatible",
             "UninstallDisplayIcon={app}\$exeName",
             "",
-            "[Languages]",
-            'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"',
-            'Name: "english"; MessagesFile: "compiler:Default.isl"',
+            "[Languages]"
+          )
+
+          if ($zhAvailable) {
+            $issLines += 'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"'
+          }
+          $issLines += 'Name: "english"; MessagesFile: "compiler:Default.isl"'
+
+          $issLines += @(
             "",
             "[Tasks]",
-            'Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"',
+            ('Name: "desktopicon"; Description: "' + $(if ($zhAvailable) { "创建桌面快捷方式" } else { "Create a desktop shortcut" }) + '"; GroupDescription: "' + $(if ($zhAvailable) { "附加图标:" } else { "Additional icons:" }) + '"'),
             "",
             "[Files]",
             "Source: `"$releaseDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs",
@@ -191,7 +223,7 @@ jobs:
             "Name: `"{autodesktop}\$appName`"; Filename: `"{app}\$exeName`"; Tasks: desktopicon",
             "",
             "[Run]",
-            "Filename: `"{app}\$exeName`"; Description: `"启动 $appName`"; Flags: nowait postinstall skipifsilent"
+            ('Filename: "{app}\' + $exeName + '"; Description: "' + $(if ($zhAvailable) { "启动 $appName" } else { "Launch $appName" }) + '"; Flags: nowait postinstall skipifsilent')
           )
           $issContent = $issLines -join "`r`n"
 
