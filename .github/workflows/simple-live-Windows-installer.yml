@@ -1,4 +1,4 @@
-name: simple-live-Windows-installer
+name: Build Windows Installer for Latest Release
 
 # 手动触发：可以在 Actions 页面点击 "Run workflow" 运行
 # 不再本地编译 Flutter 源码，而是直接下载源仓库官方发布的已编译 Windows zip 资产，
@@ -48,12 +48,27 @@ jobs:
 
           SOURCE_RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.html_url')
 
-          # 主 App 的 Windows 资产固定命名为 SimpleLive-Windows-<tag>.zip
-          ASSET_NAME="SimpleLive-Windows-${TAG}.zip"
+          # 资产命名不固定，但 Windows 主 App 资产文件名总是包含 "windows"（不区分大小写）
+          # 且是 .zip 格式（排除 TV 端 SimpleLiveTV-Windows-... 这类含 "tv" 的资产）
+          MATCHED_NAMES=$(echo "$RELEASE_JSON" | jq -r '
+            [.assets[] | select(
+              (.name | ascii_downcase | contains("windows")) and
+              (.name | ascii_downcase | endswith(".zip")) and
+              (.name | ascii_downcase | contains("tv") | not)
+            ) | .name]
+          ')
+          MATCH_COUNT=$(echo "$MATCHED_NAMES" | jq -r 'length')
+
+          if [ "$MATCH_COUNT" -gt 1 ]; then
+            echo "警告：匹配到多个符合条件的资产，将自动取第一个，其余候选如下："
+            echo "$MATCHED_NAMES" | jq -r '.[]'
+          fi
+
+          ASSET_NAME=$(echo "$MATCHED_NAMES" | jq -r '.[0] // empty')
           ASSET_URL=$(echo "$RELEASE_JSON" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name == $name) | .browser_download_url')
 
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" == "null" ]; then
-            echo "未找到预期资产名 $ASSET_NAME，列出该 release 下所有资产供排查："
+          if [ -z "$ASSET_NAME" ] || [ -z "$ASSET_URL" ] || [ "$ASSET_URL" == "null" ]; then
+            echo "未找到匹配 'windows' 关键词的 .zip 资产，列出该 release 下所有资产供排查："
             echo "$RELEASE_JSON" | jq -r '.assets[].name'
             exit 1
           fi
